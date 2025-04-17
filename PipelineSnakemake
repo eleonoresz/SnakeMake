@@ -1,0 +1,169 @@
+
+SAMPLES = glob_wildcards("000.fastq/{name}.fastq")[0]
+print(SAMPLES)
+
+rule all:
+    input:
+        expand("010.fastqc/{sample}_fastqc.zip", sample=SAMPLES),
+        expand("020.bwa/{name}.bam", name=SAMPLES),
+        expand("030.samtools/{sample}.bam.bai", sample=SAMPLES),
+        "040.cleaned/raw_snps.vcf",
+        "040.cleaned/clean_snps.vcf",
+        "050.snpEff/annotated_snps.vcf",
+        "060.DataBase/snps_annotated.db",
+        "060.DataBase/HighImpacts.tsv"
+        
+
+# FAST-Q workflow
+rule fastqc:
+# input: all the fastq files in the 000.fastq directory
+    input:
+        "000.fastq/{name}.fastq"
+# output: the fastq files in the 001.aggregate_fastq directory
+    output:
+        "010.fastqc/{name}_fastqc.zip"
+    shell:
+        "fastqc -f fastq {input} --outdir=010.fastqc"
+
+# BWA workflow 020.bwa
+
+rule bwa_align:
+    input:
+        fq="000.fastq/{name}.fastq",
+        ref="/staging/leuven/stg_00079/teaching/hg38_9/chr9.fa"
+    output:
+        "020.bwa/{name}.bam"
+    log:
+        "logs/bwa_{name}.log"
+    shell:
+        "bwa mem {input.ref} {input.fq} | samtools view -bS -o {output} 2> {log}"
+
+# samtools 030
+
+rule samtools_processing:
+    input:
+        "020.bwa/{name}.bam"  # Update this to accept .bam files
+    output:
+        "030.samtools/{name}.bam",
+        "030.samtools/{name}.bam.bai"
+    log:
+        "logs/samtools_{name}.log"
+    shell:
+        "samtools sort {input} -o {output[0]} && samtools index {output[0]} 2> {log}"
+
+
+# cleaning of the dataset
+
+rule gettingSNP:
+    input:
+        cells = expand("020.bwa/{sample}.bam", sample=SAMPLES),
+        #normal = "020.bwa/SAMPLES[0].bam",
+        #tumor = "020.bwa/SAMPLES[1].bam",
+        ref="/staging/leuven/stg_00079/teaching/hg38_9/chr9.fa"
+    output:
+        "040.cleaned/raw_snps.vcf"
+    shell:
+        "bcftools mpileup -Ou -f {input.ref} {input.cells} \ | bcftools call -mv -Ov -o {output}"
+
+rule cleaningSNP:
+    input:
+        cells = "040.cleaned/raw_snps.vcf",
+        ref="/staging/leuven/stg_00079/teaching/hg38_9/chr9.fa"
+    output:
+        "040.cleaned/clean_snps.vcf"
+    shell:
+       """
+        vt decompose {input.cells} | \
+        vt normalize -n -r {input.ref} - | \
+        vt uniq - | \
+        vt view -f 'QUAL>20' -h - > {output}
+        """
+
+# snpEff
+
+rule snpEff:
+    input:
+        cells = "040.cleaned/clean_snps.vcf",
+        SNPEFF_JAR="/lustre1/project/stg_00079/teaching/I0U19a_conda_2025/share/snpeff-5.2-1/snpEff.jar"
+
+    output:
+        "050.snpEff/annotated_snps.vcf"
+    shell:
+        """
+        java -Xmx3400m -jar {input.SNPEFF_JAR} \
+        eff hg38 -dataDir /staging/leuven/stg_00079/teaching/snpeff_db \
+        {input.cells} > {output}
+        """
+
+# make sqlite database
+
+rule sqliteDB:
+    input:
+        vcf="/lustre1/project/stg_00079/teaching/data/snps.annotated.vcf"
+    output:
+        db="060.DataBase/snps_annotated.db"
+    run:
+        import vcfpy
+        import pandas as pd
+        import sqlite3
+
+        # Load VCF file
+        vcf_reader = vcfpy.Reader.from_path(input.vcf)
+
+        # Convert VCF records to a list of dictionaries
+        records = []
+        for record in vcf_reader:
+            records.append({
+                "CHROM": record.CHROM,
+                "POS": record.POS,
+                "ID": ",".join(record.ID) if isinstance(record.ID, list) else str(record.ID),
+                "REF": record.REF,
+                "ALT": ",".join(map(str, record.ALT)),  # Convert list to comma-separated string
+                "QUAL": record.QUAL,
+                "FILTER": ",".join(map(str, record.FILTER)),  # Convert list to comma-separated string
+                "INFO": str(record.INFO)  # Convert dictionary to string
+            })
+
+        # Close the VCF reader
+        vcf_reader.close()
+
+        # Convert to DataFrame
+        df = pd.DataFrame(records)
+
+        # Connect to SQLite database
+        conn = sqlite3.connect(output.db)
+
+        # Save DataFrame to SQLite
+        df.to_sql("vcf_data", conn, if_exists="replace", index=False)
+        # Commit and close connection
+        conn.commit()
+        conn.close()
+
+        print("VCF data successfully stored in SQLite database!")
+
+# make sqlite database
+
+rule tsvHighImpact:
+    input:
+        db="060.DataBase/snps_annotated.db"
+    output:
+        tsvhi="060.DataBase/HighImpacts.tsv"
+    run:
+        import pandas as pd
+        import sqlite3
+        
+        # Connect to database
+        conn = sqlite3.connect(input.db)
+        
+        # Load the data
+        df = pd.read_sql("SELECT * FROM vcf_data", conn)
+        
+        # Close connection
+        conn.close()
+        
+        # Extract high-impact variants
+        df_high_impact = df[df["INFO"].str.contains("HIGH", na=False)]
+        
+        # Display results
+        print(df_high_impact)
+        df_high_impact.to_csv(output.tsvhi, sep="\t", index=False)
